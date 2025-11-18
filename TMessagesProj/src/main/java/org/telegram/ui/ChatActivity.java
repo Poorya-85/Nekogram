@@ -26561,7 +26561,6 @@ public class ChatActivity extends BaseFragment implements
                 pendingRequestsDelegate.onBackToScreen();
             }
             updateMessagesVisiblePart(false);
-            setNavigationBarColor(getNavigationBarColor());
         } else {
             getNotificationCenter().onAnimationFinish(transitionAnimationIndex);
             NotificationCenter.getGlobalInstance().onAnimationFinish(transitionAnimationGlobalIndex);
@@ -42051,25 +42050,6 @@ public class ChatActivity extends BaseFragment implements
         }
         TLRPC.WallPaper wallPaper = chatThemeController.getDialogWallpaper(dialog_id);
         themeDelegate.setCurrentTheme(themeDelegate.chatTheme, wallPaper, openAnimationStartTime != 0, null);
-    }
-
-    @Override
-    public int getNavigationBarColor() {
-        int color;
-        if (chatActivityEnterView != null && chatActivityEnterView.isPopupShowing()) {
-            color = getThemedColor(Theme.key_chat_emojiPanelBackground);
-        } else {
-            color = getThemedColor(Theme.key_chat_messagePanelBackground);
-        }
-        if (sheetsStack != null) {
-            for (int i = 0; i < sheetsStack.size(); ++i) {
-                AttachedSheet sheet = sheetsStack.get(i);
-                if (sheet.attachedToParent()) {
-                    color = sheet.getNavigationBarColor(color);
-                }
-            }
-        }
-        return color;
     }
 
     @Override

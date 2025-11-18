@@ -11403,10 +11403,6 @@ public class ChatActivityEnterView extends FrameLayout implements
         if (stickersExpanded && show != 1) {
             setStickersExpanded(false, false, false);
         }
-        AndroidUtilities.runOnUIThread(() -> {
-            if (parentFragment != null)
-                parentFragment.setNavigationBarColor(show == 1 ? getThemedColor(Theme.key_chat_emojiPanelBackground) : parentFragment.getNavigationBarColor());
-        }, show == 1 ? 0 : 200);
         updateFieldHint(false);
         checkBotMenu();
     }
