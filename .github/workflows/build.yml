@@ -1,0 +1,245 @@
+name: Build Nekogram Blur
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+    
+    - name: Set up JDK 21
+      uses: actions/setup-java@v4
+      with:
+        java-version: '21'
+        distribution: 'temurin'
+    
+    - name: Setup Android SDK
+      uses: android-actions/setup-android@v3
+
+    - name: Create Extra.java
+      run: |
+        cat > TMessagesProj/src/main/java/tw/nekomimi/nekogram/Extra.java << 'EOF'
+        package tw.nekomimi.nekogram;
+        
+        public class Extra {
+            public static final String APPCENTER_SECRET = "";
+            public static final String SIGNATURE = "";
+            public static final String ABI_VERSION = "0";
+            public static final int BUILD_VERSION = 1;
+            public static final String BUILD_TYPE = "debug";
+            public static String BOT_TOKEN = "";
+            public static String MINI_APP_BOT_USERNAME = "";
+            public static String MINI_APP_URL = "";
+            public static String UPDATE_METADATA_URL = "";
+            public static String UPDATE_METADATA_URL_CANARY = "";
+        }
+        EOF
+
+    - name: Create blur directory
+      run: mkdir -p TMessagesProj/src/main/java/tw/nekomimi/nekogram/blur
+
+    - name: Create BlurBubbleHelper.java
+      run: |
+        cat > TMessagesProj/src/main/java/tw/nekomimi/nekogram/blur/BlurBubbleHelper.java << 'EOF'
+        package tw.nekomimi.nekogram.blur;
+        import android.content.Context;
+        import android.graphics.*;
+        import android.os.Build;
+        import android.renderscript.*;
+        import android.view.View;
+        import org.telegram.messenger.AndroidUtilities;
+        import org.telegram.messenger.SharedConfig;
+        import org.telegram.ui.ActionBar.Theme;
+
+        public class BlurBubbleHelper {
+            private static final int DOWNSCALE = 8;
+            private static RenderScript rs;
+            private static ScriptIntrinsicBlur blurScript;
+            public static boolean blurEnabled = true;
+            public static float blurRadius = 25f;
+            public static float blurAlpha = 0.75f;
+            private static Paint blurPaint = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG);
+            private static Paint overlayPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+            private static Paint borderPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+            private static Path bubblePath = new Path();
+            static {
+                overlayPaint.setStyle(Paint.Style.FILL);
+                borderPaint.setStyle(Paint.Style.STROKE);
+                borderPaint.setStrokeWidth(AndroidUtilities.dp(0.5f));
+            }
+            public static void init(Context ctx) {
+                if (rs == null && Build.VERSION.SDK_INT < 31) {
+                    try { rs = RenderScript.create(ctx); blurScript = ScriptIntrinsicBlur.create(rs, Element.U8_4(rs)); } catch (Exception e) {}
+                }
+            }
+            public static void clearCache() {}
+            public static boolean shouldEnableBlur() { return blurEnabled && SharedConfig.getDevicePerformanceClass() != SharedConfig.PERFORMANCE_CLASS_LOW; }
+            public static void drawBlurBubble(Canvas canvas, View bgView, int l, int t, int r, int b, boolean isOut, boolean isSel, Theme.ResourcesProvider rp) {
+                if (!blurEnabled || bgView == null) return;
+                int w = r - l, h = b - t;
+                if (w <= 0 || h <= 0) return;
+                int save = canvas.save();
+                try {
+                    Bitmap blurred = captureAndBlur(bgView, l, t, w, h);
+                    if (blurred == null) { canvas.restoreToCount(save); return; }
+                    buildPath(l, t, r, b, isOut);
+                    canvas.clipPath(bubblePath);
+                    canvas.drawBitmap(blurred, l, t, blurPaint);
+                    int color = isOut ? (isSel ? Theme.getColor(Theme.key_chat_outBubbleSelected, rp) : Theme.getColor(Theme.key_chat_outBubble, rp)) : (isSel ? Theme.getColor(Theme.key_chat_inBubbleSelected, rp) : Theme.getColor(Theme.key_chat_inBubble, rp));
+                    borderPaint.setColor(Theme.getColor(isOut ? Theme.key_chat_outBubbleShadow : Theme.key_chat_inBubbleShadow, rp));
+                    overlayPaint.setColor(Color.argb((int)(Color.alpha(color) * blurAlpha), Color.red(color), Color.green(color), Color.blue(color)));
+                    canvas.drawPath(bubblePath, overlayPaint);
+                    canvas.drawPath(bubblePath, borderPaint);
+                    blurred.recycle();
+                } catch (Exception e) {}
+                canvas.restoreToCount(save);
+            }
+            private static Bitmap captureAndBlur(View v, int x, int y, int w, int h) {
+                try {
+                    int sw = Math.max(1, w / DOWNSCALE), sh = Math.max(1, h / DOWNSCALE);
+                    Bitmap cap = Bitmap.createBitmap(sw, sh, Bitmap.Config.ARGB_8888);
+                    Canvas c = new Canvas(cap);
+                    c.scale(1f / DOWNSCALE, 1f / DOWNSCALE);
+                    c.translate(-x, -y);
+                    if (v.getBackground() != null) v.getBackground().draw(c);
+                    Bitmap blurred = blur(cap);
+                    Bitmap result = Bitmap.createScaledBitmap(blurred, w, h, true);
+                    cap.recycle();
+                    if (blurred != cap) blurred.recycle();
+                    return result;
+                } catch (Exception e) { return null; }
+            }
+            private static Bitmap blur(Bitmap in) {
+                if (Build.VERSION.SDK_INT >= 31) {
+                    try {
+                        Bitmap out = Bitmap.createBitmap(in.getWidth(), in.getHeight(), Bitmap.Config.ARGB_8888);
+                        Canvas c = new Canvas(out);
+                        RenderNode n = new RenderNode("b");
+                        n.setPosition(0, 0, in.getWidth(), in.getHeight());
+                        n.setRenderEffect(RenderEffect.createBlurEffect(blurRadius / DOWNSCALE, blurRadius / DOWNSCALE, Shader.TileMode.CLAMP));
+                        Canvas nc = n.beginRecording();
+                        nc.drawBitmap(in, 0, 0, null);
+                        n.endRecording();
+                        c.drawRenderNode(n);
+                        return out;
+                    } catch (Exception e) {}
+                }
+                if (rs != null && blurScript != null) {
+                    try {
+                        Bitmap out = Bitmap.createBitmap(in.getWidth(), in.getHeight(), in.getConfig());
+                        Allocation inA = Allocation.createFromBitmap(rs, in);
+                        Allocation outA = Allocation.createFromBitmap(rs, out);
+                        blurScript.setRadius(Math.min(25f, blurRadius / DOWNSCALE));
+                        blurScript.setInput(inA);
+                        blurScript.forEach(outA);
+                        outA.copyTo(out);
+                        inA.destroy(); outA.destroy();
+                        return out;
+                    } catch (Exception e) {}
+                }
+                return in;
+            }
+            private static void buildPath(int l, int t, int r, int b, boolean isOut) {
+                bubblePath.reset();
+                float rad = AndroidUtilities.dp(17), tw = AndroidUtilities.dp(9), th = AndroidUtilities.dp(6);
+                if (isOut) {
+                    float ri = r - tw;
+                    bubblePath.moveTo(l + rad, t); bubblePath.lineTo(ri - rad, t); bubblePath.quadTo(ri, t, ri, t + rad);
+                    bubblePath.lineTo(ri, b - rad - th); bubblePath.quadTo(ri, b - th / 2, r, b); bubblePath.quadTo(ri, b, ri - rad, b);
+                    bubblePath.lineTo(l + rad, b); bubblePath.quadTo(l, b, l, b - rad); bubblePath.lineTo(l, t + rad); bubblePath.quadTo(l, t, l + rad, t);
+                } else {
+                    float le = l + tw;
+                    bubblePath.moveTo(le + rad, t); bubblePath.lineTo(r - rad, t); bubblePath.quadTo(r, t, r, t + rad);
+                    bubblePath.lineTo(r, b - rad); bubblePath.quadTo(r, b, r - rad, b); bubblePath.lineTo(le + rad, b);
+                    bubblePath.quadTo(le, b, l, b); bubblePath.quadTo(le, b - th / 2, le, b - rad - th);
+                    bubblePath.lineTo(le, t + rad); bubblePath.quadTo(le, t, le + rad, t);
+                }
+                bubblePath.close();
+            }
+        }
+        EOF
+
+    - name: Create BlurBubbleConfig.java
+      run: |
+        cat > TMessagesProj/src/main/java/tw/nekomimi/nekogram/blur/BlurBubbleConfig.java << 'EOF'
+        package tw.nekomimi.nekogram.blur;
+        import android.content.Context;
+        import android.content.SharedPreferences;
+        import org.telegram.messenger.ApplicationLoader;
+        public class BlurBubbleConfig {
+            public static boolean blurEnabled = true;
+            public static boolean blurIncoming = true;
+            public static boolean blurOutgoing = true;
+            public static float blurRadius = 25f;
+            public static float blurAlpha = 0.75f;
+            private static SharedPreferences p;
+            public static void load() {
+                p = ApplicationLoader.applicationContext.getSharedPreferences("blur", Context.MODE_PRIVATE);
+                blurEnabled = p.getBoolean("on", true);
+                blurIncoming = p.getBoolean("in", true);
+                blurOutgoing = p.getBoolean("out", true);
+                blurRadius = p.getFloat("r", 25f);
+                blurAlpha = p.getFloat("a", 0.75f);
+                BlurBubbleHelper.blurEnabled = blurEnabled;
+                BlurBubbleHelper.blurRadius = blurRadius;
+                BlurBubbleHelper.blurAlpha = blurAlpha;
+            }
+            public static boolean shouldBlurIncoming() { return blurEnabled && blurIncoming; }
+            public static boolean shouldBlurOutgoing() { return blurEnabled && blurOutgoing; }
+        }
+        EOF
+
+    - name: Create google-services.json
+      run: |
+        JSON='{"project_info":{"project_number":"000","project_id":"neko","storage_bucket":"neko.appspot.com"},"client":[{"client_info":{"mobilesdk_app_id":"1:000:android:000","android_client_info":{"package_name":"tw.nekomimi.nekogram"}},"api_key":[{"current_key":"AIza000"}],"services":{"appinvite_service":{"other_platform_oauth_client":[]}}},{"client_info":{"mobilesdk_app_id":"1:000:android:001","android_client_info":{"package_name":"tw.nekomimi.nekogram.beta"}},"api_key":[{"current_key":"AIza001"}],"services":{"appinvite_service":{"other_platform_oauth_client":[]}}}],"configuration_version":"1"}'
+        echo "$JSON" > TMessagesProj/google-services.json
+        for dir in TMessagesProj_App TMessagesProj-App; do
+          if [ -d "$dir" ]; then
+            echo "$JSON" > "$dir/google-services.json"
+            mkdir -p "$dir/src/debug" "$dir/src/release"
+            echo "$JSON" > "$dir/src/debug/google-services.json"
+            echo "$JSON" > "$dir/src/release/google-services.json"
+          fi
+        done
+
+    - name: Setup Gradle
+      uses: gradle/actions/setup-gradle@v3
+    
+    - name: Make gradlew executable
+      run: chmod +x gradlew
+
+    - name: Build APK
+      run: ./gradlew assembleDebug --no-daemon --warning-mode=none
+      env:
+        ANDROID_HOME: ${{ env.ANDROID_SDK_ROOT }}
+    
+    - name: Find APKs
+      run: find . -name "*.apk" -type f
+
+    - name: Upload APK
+      uses: actions/upload-artifact@v4
+      with:
+        name: Nekogram-Blur-APK
+        path: "**/build/outputs/apk/**/*.apk"
+        if-no-files-found: warn
+```
+
+---
+
+## مراحل:
+
+### ۱. برو به ریپو
+### ۲. **Add file** → **Create new file**
+### ۳. اسم فایل:
+```
+.github/workflows/build.yml
