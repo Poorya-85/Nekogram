@@ -232,5 +232,3 @@ jobs:
         name: Nekogram-Blur-APK
         path: "**/build/outputs/apk/**/*.apk"
         if-no-files-found: warn
-
-.github/workflows/build.yml
