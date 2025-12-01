@@ -1,0 +1,356 @@
+name: Add Blur Bubbles & Build Nekogram
+
+on:
+push:
+branches: [ main, master ]
+workflow_dispatch:
+
+jobs:
+add-blur-and-build:
+runs-on: ubuntu-latest
+env:
+JAVA_HOME_21_X64: /usr/lib/jvm/adoptopenjdk-21-hotspot
+steps:
+- name: Checkout repository
+uses: actions/checkout@v4
+with:
+fetch-depth: 0
+submodules: recursive
+
+  - name: Set up JDK 21
+    uses: actions/setup-java@v4
+    with:
+      java-version: '21'
+      distribution: 'temurin'
+
+  - name: Setup Android SDK
+    uses: android-actions/setup-android@v3
+
+  - name: Create blur package dir
+    run: mkdir -p TMessagesProj/src/main/java/tw/nekomimi/nekogram/blur
+
+  - name: Add BlurBubbleSettings.java
+    run: |
+      cat > TMessagesProj/src/main/java/tw/nekomimi/nekogram/blur/BlurBubbleSettings.java <<'EOF'
+      package tw.nekomimi.nekogram.blur;
+
+      import android.content.Context;
+      import android.content.SharedPreferences;
+      import org.telegram.messenger.ApplicationLoader;
+
+      public class BlurBubbleSettings {
+          private static final String PREF = "blur_bubble_prefs_v1";
+          private static SharedPreferences prefs;
+
+          public static boolean enabled = true;
+          public static boolean blurIncoming = true;
+          public static boolean blurOutgoing = true;
+          public static float radius = 20f; // px
+          public static float alpha = 0.75f; // 0..1
+          public static int downscale = 4; // factor
+
+          public static void load() {
+              if (prefs == null) prefs = ApplicationLoader.applicationContext.getSharedPreferences(PREF, Context.MODE_PRIVATE);
+              enabled = prefs.getBoolean("enabled", true);
+              blurIncoming = prefs.getBoolean("in", true);
+              blurOutgoing = prefs.getBoolean("out", true);
+              radius = prefs.getFloat("radius", 20f);
+              alpha = prefs.getFloat("alpha", 0.75f);
+              downscale = prefs.getInt("downscale", 4);
+          }
+
+          public static void save() {
+              if (prefs == null) prefs = ApplicationLoader.applicationContext.getSharedPreferences(PREF, Context.MODE_PRIVATE);
+              SharedPreferences.Editor e = prefs.edit();
+              e.putBoolean("enabled", enabled);
+              e.putBoolean("in", blurIncoming);
+              e.putBoolean("out", blurOutgoing);
+              e.putFloat("radius", radius);
+              e.putFloat("alpha", alpha);
+              e.putInt("downscale", downscale);
+              e.apply();
+          }
+      }
+      EOF
+
+  - name: Add BlurBubbleEngine.java
+    run: |
+      cat > TMessagesProj/src/main/java/tw/nekomimi/nekogram/blur/BlurBubbleEngine.java <<'EOF'
+      package tw.nekomimi.nekogram.blur;
+
+      import android.graphics.Bitmap;
+      import android.graphics.Canvas;
+      import android.graphics.RenderEffect;
+      import android.graphics.Shader;
+      import android.os.Build;
+      import android.view.View;
+      import android.util.LruCache;
+
+      public class BlurBubbleEngine {
+          private static final int CACHE_MB = 16;
+          private static final int CACHE_BYTES = CACHE_MB * 1024 * 1024;
+          private static final LruCache<String, Bitmap> cache = new LruCache<String, Bitmap>(CACHE_BYTES) {
+              @Override protected int sizeOf(String key, Bitmap value) {
+                  return value.getRowBytes() * value.getHeight();
+              }
+          };
+
+          public static void clearCache() {
+              synchronized (cache) { cache.evictAll(); }
+          }
+
+          private static String keyFor(int l, int t, int w, int h, float radius, int vs) {
+              return l + "_" + t + "_" + w + "x" + h + "_r" + (int)radius + "_v" + vs;
+          }
+
+          public static Bitmap getBlurredSnapshot(View srcView, int x, int y, int w, int h) {
+              try {
+                  if (w <= 0 || h <= 0) return null;
+                  if (Build.VERSION.SDK_INT < 31) return null;
+
+                  BlurBubbleSettings.load();
+                  int ds = Math.max(1, BlurBubbleSettings.downscale);
+                  int sw = Math.max(1, w / ds);
+                  int sh = Math.max(1, h / ds);
+
+                  int viewHash = System.identityHashCode(srcView);
+                  String key = keyFor(x, y, sw, sh, BlurBubbleSettings.radius, viewHash);
+                  Bitmap cached;
+                  synchronized (cache) { cached = cache.get(key); }
+                  if (cached != null && !cached.isRecycled()) return cached;
+
+                  Bitmap small = Bitmap.createBitmap(sw, sh, Bitmap.Config.ARGB_8888);
+                  Canvas c = new Canvas(small);
+                  c.scale(1f / ds, 1f / ds);
+                  c.translate(-x, -y);
+                  srcView.draw(c);
+
+                  float effectiveRadius = Math.max(0f, BlurBubbleSettings.radius / ds);
+                  Bitmap out = Bitmap.createBitmap(small.getWidth(), small.getHeight(), Bitmap.Config.ARGB_8888);
+                  Canvas outCanvas = new Canvas(out);
+
+                  try {
+                      RenderEffect blurEffect = RenderEffect.createBlurEffect(effectiveRadius, effectiveRadius, Shader.TileMode.CLAMP);
+                      outCanvas.setRenderEffect(blurEffect);
+                      outCanvas.drawBitmap(small, 0f, 0f, null);
+                  } catch (Exception e) {
+                      outCanvas.drawBitmap(small, 0f, 0f, null);
+                  }
+
+                  synchronized (cache) { cache.put(key, out); }
+                  small.recycle();
+                  return out;
+              } catch (Throwable t) {
+                  return null;
+              }
+          }
+      }
+      EOF
+
+  - name: Add BlurBubblePainter.java
+    run: |
+      cat > TMessagesProj/src/main/java/tw/nekomimi/nekogram/blur/BlurBubblePainter.java <<'EOF'
+      package tw.nekomimi.nekogram.blur;
+
+      import android.graphics.Bitmap;
+      import android.graphics.Canvas;
+      import android.graphics.Paint;
+      import android.graphics.Path;
+      import org.telegram.ui.ActionBar.Theme;
+      import android.view.View;
+      import android.graphics.Color;
+      import android.os.Build;
+
+      public class BlurBubblePainter {
+          private static final Paint bitmapPaint = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG);
+          private static final Paint overlayPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+          private static final Paint borderPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+          private static final Path bubblePath = new Path();
+
+          static {
+              overlayPaint.setStyle(Paint.Style.FILL);
+              borderPaint.setStyle(Paint.Style.STROKE);
+              borderPaint.setStrokeWidth(1f);
+          }
+
+          public static void onScrollFastClearCache() {
+              BlurBubbleEngine.clearCache();
+          }
+
+          private static void buildTelegramStylePath(int l, int t, int r, int b, boolean isOut) {
+              bubblePath.reset();
+              float rad = 20f;
+              float tailW = 10f, tailH = 6f;
+              if (isOut) {
+                  float ri = r - tailW;
+                  bubblePath.moveTo(l + rad, t);
+                  bubblePath.lineTo(ri - rad, t);
+                  bubblePath.quadTo(ri, t, ri, t + rad);
+                  bubblePath.lineTo(ri, b - rad - tailH);
+                  bubblePath.quadTo(ri, b - tailH/2f, r, b);
+                  bubblePath.quadTo(ri, b, ri - rad, b);
+                  bubblePath.lineTo(l + rad, b);
+                  bubblePath.quadTo(l, b, l, b - rad);
+                  bubblePath.lineTo(l, t + rad);
+                  bubblePath.quadTo(l, t, l + rad, t);
+              } else {
+                  float le = l + tailW;
+                  bubblePath.moveTo(le + rad, t);
+                  bubblePath.lineTo(r - rad, t);
+                  bubblePath.quadTo(r, t, r, t + rad);
+                  bubblePath.lineTo(r, b - rad);
+                  bubblePath.quadTo(r, b, r - rad, b);
+                  bubblePath.lineTo(le + rad, b);
+                  bubblePath.quadTo(le, b, l, b);
+                  bubblePath.quadTo(le, b - tailH/2f, le, b - rad - tailH);
+                  bubblePath.lineTo(le, t + rad);
+                  bubblePath.quadTo(le, t, le + rad, t);
+              }
+              bubblePath.close();
+          }
+
+          public static void draw(Canvas canvas, View bgView, int l, int t, int r, int b, boolean isOut, boolean isSelected, Theme.ResourcesProvider rp) {
+              try {
+                  BlurBubbleSettings.load();
+                  if (!BlurBubbleSettings.enabled) return;
+                  if (isOut && !BlurBubbleSettings.blurOutgoing) return;
+                  if (!isOut && !BlurBubbleSettings.blurIncoming) return;
+                  if (bgView == null) return;
+                  if (Build.VERSION.SDK_INT < 31) return;
+
+                  int w = r - l, h = b - t;
+                  if (w <= 0 || h <= 0) return;
+
+                  Bitmap blurred = BlurBubbleEngine.getBlurredSnapshot(bgView, l, t, w, h);
+                  if (blurred == null) return;
+
+                  canvas.save();
+                  buildTelegramStylePath(l, t, r, b, isOut);
+                  canvas.clipPath(bubblePath);
+
+                  float sx = (float) w / blurred.getWidth();
+                  float sy = (float) h / blurred.getHeight();
+                  canvas.save();
+                  canvas.translate(l, t);
+                  canvas.scale(sx, sy);
+                  canvas.drawBitmap(blurred, 0, 0, bitmapPaint);
+                  canvas.restore();
+
+                  int colorKey = isOut ? Theme.key_chat_outBubble : Theme.key_chat_inBubble;
+                  int color = Theme.getColor(colorKey, rp);
+                  int a = Math.min(255, Math.max(0, (int) (BlurBubbleSettings.alpha * 255)));
+                  int overlay = Color.argb(a, Color.red(color), Color.green(color), Color.blue(color));
+                  overlayPaint.setColor(overlay);
+                  canvas.drawPath(bubblePath, overlayPaint);
+
+                  int borderKey = isOut ? Theme.key_chat_outBubbleShadow : Theme.key_chat_inBubbleShadow;
+                  borderPaint.setColor(Theme.getColor(borderKey, rp));
+                  canvas.drawPath(bubblePath, borderPaint);
+
+                  canvas.restore();
+
+              } catch (Throwable t2) {
+                  // ignore
+              }
+          }
+      }
+      EOF
+
+  - name: Attempt to patch ChatMessageCell files
+    run: |
+      set -e
+      # Find candidate files that likely contain ChatMessage cell drawing logic
+      files=$(git ls-files | grep -Ei 'ChatMessage.*\.java' || true)
+      if [ -z "$files" ]; then
+        echo "No ChatMessage*.java found — trying alternate search for drawBackground/drawContent"
+        files=$(git ls-files | xargs grep -Il "drawBackground\\(|drawContent\\(" || true)
+      fi
+      echo "Candidate files to patch:"
+      printf "%s\n" "$files"
+
+      PATCH_SNIPPET_IMPORT='import tw.nekomimi.nekogram.blur.BlurBubblePainter;\nimport tw.nekomimi.nekogram.blur.BlurBubbleSettings;'
+      PATCH_CALL='        // *** BlurBubble injected by workflow ***\n        try {\n            BlurBubbleSettings.load();\n            if (BlurBubbleSettings.enabled) {\n                BlurBubblePainter.draw(canvas, this, backgroundLeft, backgroundTop, backgroundRight, backgroundBottom, isOut, isSelected, resourcesProvider);\n                return;\n            }\n        } catch (Throwable __t) { }\n'
+
+      for f in $files; do
+        echo "Patching $f"
+        # add imports if not present
+        if ! grep -q "tw.nekomimi.nekogram.blur.BlurBubblePainter" "$f"; then
+          # insert imports after package declaration and existing imports block
+          awk -v ins="$PATCH_SNIPPET_IMPORT" '
+            BEGIN {printed=0}
+            /package / && printed==0 { print; next }
+            { print }
+          ' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+          # try to place imports: naive append after package+first imports
+          sed -i "/package /a\\
+
+$PATCH_SNIPPET_IMPORT
+" "$f"
+fi
+
+        # try to find drawBackground or drawContent method and inject snippet right after opening brace
+        if grep -q "void drawBackground" "$f"; then
+          sed -i "/void drawBackground/,+5 { /{/ a\\
+
+$PATCH_CALL
+}" "$f" || true
+elif grep -q "void drawContent" "$f"; then
+sed -i "/void drawContent/,+5 { /{/ a\
+$PATCH_CALL
+}" "$f" || true
+else
+# as fallback search for typical variables and insert near them (best-effort)
+sed -n '1,200p' "$f"
+# try to insert before any occurrence of "drawRect" as last resort
+sed -i "0,/drawRect/ s//${PATCH_CALL}drawRect/" "$f" || true
+fi
+
+        git add "$f" || true
+      done
+
+      # If no file was patched, create a small README in blur folder explaining manual steps
+      if [ -z "$files" ]; then
+        cat > TMessagesProj/src/main/java/tw/nekomimi/nekogram/blur/README_BLUR_INTEGRATION.txt <<'EOF'
+      Automatically added blur classes, but could not locate ChatMessage cell to patch.
+      You must manually add the following call in the method that draws message bubble background:
+
+          BlurBubbleSettings.load();
+          if (BlurBubbleSettings.enabled) {
+              BlurBubblePainter.draw(canvas, this, backgroundLeft, backgroundTop, backgroundRight, backgroundBottom, isOut, isSelected, resourcesProvider);
+              return;
+          }
+
+      Typical location: TMessagesProj/src/main/java/org/telegram/ui/Cells/ChatMessageCell.java or similar.
+      EOF
+        git add TMessagesProj/src/main/java/tw/nekomimi/nekogram/blur/README_BLUR_INTEGRATION.txt
+      fi
+
+  - name: Commit patch & added files
+    run: |
+      set -e
+      git config user.name "github-actions[bot]"
+      git config user.email "github-actions[bot]@users.noreply.github.com"
+      if git diff --cached --quiet; then
+        echo "No changes to commit"
+      else
+        git commit -m "chore(blur): add BlurBubble classes and attempt to patch ChatMessageCell"
+        git push origin HEAD:refs/heads/add-blur-bubbles || echo "push may require permissions"
+      fi
+
+  - name: Make gradlew executable
+    run: chmod +x gradlew || true
+
+  - name: Build APK (assembleDebug)
+    run: ./gradlew assembleDebug --no-daemon --warning-mode=none || true
+    env:
+      ANDROID_HOME: ${{ env.ANDROID_SDK_ROOT }}
+
+  - name: Find APKs
+    run: find . -name "*.apk" -type f || true
+
+  - name: Upload APK
+    uses: actions/upload-artifact@v4
+    with:
+      name: Nekogram-Blur-APK
+      path: "**/build/outputs/apk/**/*.apk"
+      if-no-files-found: warn
