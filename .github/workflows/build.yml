@@ -42,6 +42,24 @@ jobs:
             public static String MINI_APP_URL = "";
             public static String UPDATE_METADATA_URL = "";
             public static String UPDATE_METADATA_URL_CANARY = "";
+            
+            public static final int APP_ID = 4;
+            public static final String APP_HASH = "014b35b6184100b085b0d0572f9b5103";
+            public static final String PLAYSTORE_APP_URL = "https://play.google.com/store/apps/details?id=tw.nekomimi.nekogram";
+            
+            public static final String TWPIC_BOT_USERNAME = "pic_bot";
+            
+            public static boolean isTrustedBot(long userId) {
+                return false;
+            }
+            
+            public static String getUserInfoBot(boolean fallback) {
+                return "userinfobot";
+            }
+            
+            public static boolean isDirectApp() {
+                return true;
+            }
         }
         EOF
 
