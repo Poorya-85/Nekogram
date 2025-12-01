@@ -232,14 +232,5 @@ jobs:
         name: Nekogram-Blur-APK
         path: "**/build/outputs/apk/**/*.apk"
         if-no-files-found: warn
-```
 
----
-
-## مراحل:
-
-### ۱. برو به ریپو
-### ۲. **Add file** → **Create new file**
-### ۳. اسم فایل:
-```
 .github/workflows/build.yml
